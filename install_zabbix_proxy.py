@@ -107,6 +107,47 @@ def install_prereqs(os_info):
         run(f"{pkgmgr} install -y wget curl")
 
 
+def get_zabbix_release_rpm_url(os_info, zabbix_version):
+    """
+    Monta a URL do pacote zabbix-release.
+
+    Observação importante:
+    - Oracle Linux 10 não usa caminho /oraclelinux/10 no repositório do Zabbix.
+      Para OL10/EL10, usamos o caminho compatível /rhel/10.
+    - Para EL10, o pacote release atual usa sufixo -6.el10.
+    - Para EL8/EL9, mantemos o padrão -1.elX.
+    """
+    major = os_info["major"]
+    os_id = os_info["id"]
+
+    if os_id in ["ol", "oracle"]:
+        if major == "10":
+            return (
+                f"https://repo.zabbix.com/zabbix/{zabbix_version}/rhel/10/x86_64/"
+                f"zabbix-release-{zabbix_version}-6.el10.noarch.rpm"
+            )
+
+        return (
+            f"https://repo.zabbix.com/zabbix/{zabbix_version}/oraclelinux/{major}/x86_64/"
+            f"zabbix-release-{zabbix_version}-1.el{major}.noarch.rpm"
+        )
+
+    distro = os_id
+    if distro in ["centos", "rocky", "almalinux"]:
+        distro = "rhel"
+
+    if major == "10":
+        return (
+            f"https://repo.zabbix.com/zabbix/{zabbix_version}/rhel/10/x86_64/"
+            f"zabbix-release-{zabbix_version}-6.el10.noarch.rpm"
+        )
+
+    return (
+        f"https://repo.zabbix.com/zabbix/{zabbix_version}/{distro}/{major}/x86_64/"
+        f"zabbix-release-{zabbix_version}-1.el{major}.noarch.rpm"
+    )
+
+
 def install_zabbix_repo(os_info, zabbix_version):
     if os_info["id"] == "ubuntu":
         release_pkg = f"zabbix-release_latest+ubuntu{os_info['version']}_all.deb"
@@ -126,22 +167,11 @@ def install_zabbix_repo(os_info, zabbix_version):
         run(f"dpkg -i {local_file}")
         run("apt-get update")
 
-    elif os_info["id"] in ["rhel", "rocky", "almalinux", "centos"]:
+    elif os_info["family"] == "rhel":
         pkgmgr = "dnf" if command_exists("dnf") else "yum"
-        major = os_info["major"]
-        distro = os_info["id"]
+        url = get_zabbix_release_rpm_url(os_info, zabbix_version)
 
-        if distro == "centos":
-            distro = "rhel"
-
-        url = f"https://repo.zabbix.com/zabbix/{zabbix_version}/{distro}/{major}/x86_64/zabbix-release-{zabbix_version}-1.el{major}.noarch.rpm"
-        run(f"rpm -Uvh {url}")
-        run(f"{pkgmgr} clean all")
-
-    elif os_info["id"] in ["ol", "oracle"]:
-        pkgmgr = "dnf" if command_exists("dnf") else "yum"
-        major = os_info["major"]
-        url = f"https://repo.zabbix.com/zabbix/{zabbix_version}/oraclelinux/{major}/x86_64/zabbix-release-{zabbix_version}-1.el{major}.noarch.rpm"
+        print(f"URL do repositório Zabbix: {url}")
         run(f"rpm -Uvh {url}")
         run(f"{pkgmgr} clean all")
 
@@ -154,7 +184,7 @@ def install_proxy(os_info):
         run("apt-get install -y zabbix-proxy-sqlite3")
     else:
         pkgmgr = "dnf" if command_exists("dnf") else "yum"
-        run(f"{pkgmgr} install -y zabbix-proxy-sqlite3")
+        run(f"{pkgmgr} install -y zabbix-proxy-sqlite3 zabbix-selinux-policy")
 
 
 def backup_file(file_path):
