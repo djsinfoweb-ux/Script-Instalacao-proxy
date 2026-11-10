@@ -1,31 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Instalador interativo de Zabbix Proxy com SQLite3.
+
+Corrige o caminho do repositorio para Oracle Linux 8/9 e utiliza
+ProxyConfigFrequency nas configuracoes do Zabbix Proxy.
+"""
 
 import os
-import sys
 import re
+import shlex
 import shutil
 import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
 
 SUPPORTED_ZABBIX = ["6.0", "6.4", "7.0", "7.2", "7.4"]
 
 
 def run(cmd, check=True, capture_output=False):
-    print(f"\n>> Executando: {cmd}")
+    """Executa um comando e interrompe a instalacao se ele falhar."""
+    if isinstance(cmd, (list, tuple)):
+        display = shlex.join(str(part) for part in cmd)
+    else:
+        display = str(cmd)
+    print(f"\n>> Executando: {display}")
     result = subprocess.run(
         cmd,
-        shell=True,
+        shell=isinstance(cmd, str),
         text=True,
         stdout=subprocess.PIPE if capture_output else None,
-        stderr=subprocess.STDOUT if capture_output else None
+        stderr=subprocess.STDOUT if capture_output else None,
     )
-
     if check and result.returncode != 0:
         if capture_output and result.stdout:
             print(result.stdout)
-        raise RuntimeError(f"Erro ao executar comando: {cmd}")
-
+        raise RuntimeError(f"Erro ao executar comando: {display}")
     if capture_output:
         return result.stdout.strip()
     return ""
@@ -40,37 +50,28 @@ def ensure_root():
 
 def ask(prompt, default=None, allowed=None, required=True):
     while True:
-        label = prompt
-        if default is not None:
-            label += f" [{default}]"
-        label += ": "
-
+        label = prompt + (f" [{default}]" if default is not None else "") + ": "
         value = input(label).strip()
-
         if not value and default is not None:
             value = default
-
         if required and not value:
-            print("Campo obrigatório.")
+            print("Campo obrigatorio.")
             continue
-
         if allowed and value not in allowed:
-            print(f"Valor inválido. Opções permitidas: {', '.join(allowed)}")
+            print(f"Valor invalido. Opcoes permitidas: {', '.join(allowed)}")
             continue
-
         return value
 
 
 def detect_os():
     os_release = Path("/etc/os-release")
     if not os_release.exists():
-        raise RuntimeError("Arquivo /etc/os-release não encontrado. Não foi possível identificar o sistema.")
-
+        raise RuntimeError("Arquivo /etc/os-release nao encontrado.")
     data = {}
     for line in os_release.read_text(encoding="utf-8").splitlines():
         if "=" in line:
-            k, v = line.split("=", 1)
-            data[k] = v.strip().strip('"')
+            key, value = line.split("=", 1)
+            data[key] = value.strip().strip('"')
 
     os_id = data.get("ID", "").lower()
     version_id = data.get("VERSION_ID", "").lower()
@@ -83,14 +84,13 @@ def detect_os():
         family = "rhel"
         major = version_id.split(".")[0]
     else:
-        raise RuntimeError(f"Sistema não suportado automaticamente: {pretty_name}")
-
+        raise RuntimeError(f"Sistema nao suportado automaticamente: {pretty_name}")
     return {
         "id": os_id,
         "version": version_id,
         "pretty_name": pretty_name,
         "family": family,
-        "major": major
+        "major": major,
     }
 
 
@@ -98,43 +98,48 @@ def command_exists(command):
     return shutil.which(command) is not None
 
 
+def pkg_manager():
+    if command_exists("dnf"):
+        return "dnf"
+    if command_exists("yum"):
+        return "yum"
+    raise RuntimeError("Nem dnf nem yum estao disponiveis neste sistema.")
+
+
 def install_prereqs(os_info):
     if os_info["family"] == "debian":
-        run("apt-get update")
-        run("apt-get install -y wget curl gnupg lsb-release")
+        run(["apt-get", "update"])
+        run(["apt-get", "install", "-y", "wget", "curl", "gnupg", "lsb-release"])
     else:
-        pkgmgr = "dnf" if command_exists("dnf") else "yum"
-        run(f"{pkgmgr} install -y wget curl")
+        run([pkg_manager(), "install", "-y", "wget", "curl"])
 
 
 def get_zabbix_release_rpm_url(os_info, zabbix_version):
-    """
-    Monta a URL do pacote zabbix-release.
+    """URL de repositorio para distros da familia RHEL.
 
-    Observação importante:
-    - Oracle Linux 10 não usa caminho /oraclelinux/10 no repositório do Zabbix.
-      Para OL10/EL10, usamos o caminho compatível /rhel/10.
-    - Para EL10, o pacote release atual usa sufixo -6.el10.
-    - Para EL8/EL9, mantemos o padrão -1.elX.
+    Zabbix 7.0 usa o layout /oracle/9/x86_64 para Oracle Linux 9.
+    Zabbix 7.2/7.4 usa /release/<distro>/9/noarch.
+    Para 6.0/6.4 o pacote compativel de RHEL e usado como fallback.
     """
     major = os_info["major"]
     os_id = os_info["id"]
+    rpm = f"zabbix-release-latest-{zabbix_version}.el{major}.noarch.rpm"
 
-    if os_id in ["ol", "oracle"]:
-        if major == "10":
-            return (
-                f"https://repo.zabbix.com/zabbix/{zabbix_version}/rhel/10/x86_64/"
-                f"zabbix-release-{zabbix_version}-6.el10.noarch.rpm"
-            )
-
+    if zabbix_version in ["7.2", "7.4"]:
+        if os_id in ["ol", "oracle"]:
+            distro = "oracle" if major != "10" else "rhel"
+        elif os_id == "almalinux":
+            distro = "alma"
+        elif os_id == "rocky":
+            distro = "rocky"
+        elif os_id == "centos":
+            distro = "centos"
+        else:
+            distro = "rhel"
         return (
-            f"https://repo.zabbix.com/zabbix/{zabbix_version}/oraclelinux/{major}/x86_64/"
-            f"zabbix-release-{zabbix_version}-1.el{major}.noarch.rpm"
+            f"https://repo.zabbix.com/zabbix/{zabbix_version}/release/"
+            f"{distro}/{major}/noarch/{rpm}"
         )
-
-    distro = os_id
-    if distro in ["centos", "rocky", "almalinux"]:
-        distro = "rhel"
 
     if major == "10":
         return (
@@ -142,55 +147,53 @@ def get_zabbix_release_rpm_url(os_info, zabbix_version):
             f"zabbix-release-{zabbix_version}-6.el10.noarch.rpm"
         )
 
+    # O repositorio Oracle separado esta disponivel no layout antigo do 7.0.
+    if os_id in ["ol", "oracle"] and zabbix_version == "7.0":
+        distro = "oracle"
+    else:
+        distro = "rhel"
     return (
         f"https://repo.zabbix.com/zabbix/{zabbix_version}/{distro}/{major}/x86_64/"
-        f"zabbix-release-{zabbix_version}-1.el{major}.noarch.rpm"
+        f"{rpm}"
     )
 
 
 def install_zabbix_repo(os_info, zabbix_version):
-    if os_info["id"] == "ubuntu":
-        release_pkg = f"zabbix-release_latest+ubuntu{os_info['version']}_all.deb"
-        url = f"https://repo.zabbix.com/zabbix/{zabbix_version}/ubuntu/pool/main/z/zabbix-release/{release_pkg}"
+    if os_info["id"] in ["ubuntu", "debian"]:
+        distro = os_info["id"]
+        release_pkg = f"zabbix-release_latest+{distro}{os_info['version']}_all.deb"
+        url = (
+            f"https://repo.zabbix.com/zabbix/{zabbix_version}/{distro}/"
+            f"pool/main/z/zabbix-release/{release_pkg}"
+        )
         local_file = f"/tmp/{release_pkg}"
-
-        run(f"wget -O {local_file} {url}")
-        run(f"dpkg -i {local_file}")
-        run("apt-get update")
-
-    elif os_info["id"] == "debian":
-        release_pkg = f"zabbix-release_latest+debian{os_info['version']}_all.deb"
-        url = f"https://repo.zabbix.com/zabbix/{zabbix_version}/debian/pool/main/z/zabbix-release/{release_pkg}"
-        local_file = f"/tmp/{release_pkg}"
-
-        run(f"wget -O {local_file} {url}")
-        run(f"dpkg -i {local_file}")
-        run("apt-get update")
-
+        run(["wget", "-O", local_file, url])
+        run(["dpkg", "-i", local_file])
+        run(["apt-get", "update"])
     elif os_info["family"] == "rhel":
-        pkgmgr = "dnf" if command_exists("dnf") else "yum"
+        manager = pkg_manager()
         url = get_zabbix_release_rpm_url(os_info, zabbix_version)
-
-        print(f"URL do repositório Zabbix: {url}")
-        run(f"rpm -Uvh {url}")
-        run(f"{pkgmgr} clean all")
-
+        print(f"URL do repositorio Zabbix: {url}")
+        # Falha claramente em caso de URL invalida, antes de alterar o repositorio.
+        run(["curl", "-fIL", "--retry", "2", "--connect-timeout", "15", url])
+        run([manager, "install", "-y", url])
+        run([manager, "clean", "all"])
     else:
-        raise RuntimeError(f"Sistema operacional não suportado para instalação automática: {os_info['pretty_name']}")
+        raise RuntimeError(f"Sistema nao suportado: {os_info['pretty_name']}")
 
 
 def install_proxy(os_info):
     if os_info["family"] == "debian":
-        run("apt-get install -y zabbix-proxy-sqlite3")
+        run(["apt-get", "install", "-y", "zabbix-proxy-sqlite3"])
     else:
-        pkgmgr = "dnf" if command_exists("dnf") else "yum"
-        run(f"{pkgmgr} install -y zabbix-proxy-sqlite3 zabbix-selinux-policy")
+        run([pkg_manager(), "install", "-y", "zabbix-proxy-sqlite3", "zabbix-selinux-policy"])
 
 
 def backup_file(file_path):
     path = Path(file_path)
     if path.exists():
-        backup = f"{file_path}.bak"
+        suffix = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = f"{file_path}.{suffix}.bak"
         shutil.copy2(file_path, backup)
         print(f"Backup criado: {backup}")
 
@@ -198,10 +201,8 @@ def backup_file(file_path):
 def set_config_value(content, key, value):
     pattern = rf"^\s*#?\s*{re.escape(key)}=.*$"
     replacement = f"{key}={value}"
-
     if re.search(pattern, content, flags=re.MULTILINE):
         return re.sub(pattern, replacement, content, flags=re.MULTILINE)
-
     return content.rstrip() + "\n" + replacement + "\n"
 
 
@@ -211,120 +212,99 @@ def remove_config_keys(content, keys):
             rf"^\s*#?\s*{re.escape(key)}=.*\n?",
             "",
             content,
-            flags=re.MULTILINE
+            flags=re.MULTILINE,
         )
     return content
 
 
 def prepare_sqlite_directory(db_path):
     db_file = Path(db_path)
+    if not db_file.is_absolute():
+        raise RuntimeError("O caminho do banco SQLite precisa ser absoluto (iniciar com /).")
     db_dir = db_file.parent
-
     db_dir.mkdir(parents=True, exist_ok=True)
-
-    run(f"chown -R zabbix:zabbix {db_dir}")
-    run(f"chmod 750 {db_dir}")
-
-    print(f"Diretório preparado: {db_dir}")
-    print("O arquivo SQLite será criado automaticamente pelo Zabbix Proxy no primeiro start.")
+    # Nao altera ownership recursivamente de bancos existentes.
+    run(["chown", "zabbix:zabbix", str(db_dir)])
+    run(["chmod", "750", str(db_dir)])
+    print(f"Diretorio preparado: {db_dir}")
+    print("Se o SQLite nao existir, o Zabbix Proxy o criara no primeiro start.")
 
 
 def configure_proxy(conf_path, proxy_name, server_addr, proxy_mode, db_path):
     conf = Path(conf_path)
-
     if not conf.exists():
-        raise RuntimeError(f"Arquivo não encontrado: {conf_path}")
-
+        raise RuntimeError(f"Arquivo nao encontrado: {conf_path}")
     backup_file(conf_path)
-
     content = conf.read_text(encoding="utf-8", errors="ignore")
-
-    content = set_config_value(content, "ProxyMode", proxy_mode)
-    content = set_config_value(content, "Server", server_addr)
-    content = set_config_value(content, "Hostname", proxy_name)
-    content = set_config_value(content, "DBName", db_path)
-    content = set_config_value(content, "LogFile", "/var/log/zabbix/zabbix_proxy.log")
-    content = set_config_value(content, "PidFile", "/run/zabbix/zabbix_proxy.pid")
-    content = set_config_value(content, "ConfigFrequency", "60")
-    content = set_config_value(content, "DataSenderFrequency", "1")
-    content = set_config_value(content, "Timeout", "30")
-
+    # Remove o nome antigo antes de definir o parametro recomendado no Zabbix 7.0.
+    content = remove_config_keys(content, ["ConfigFrequency"])
+    options = {
+        "ProxyMode": proxy_mode,
+        "Server": server_addr,
+        "Hostname": proxy_name,
+        "DBName": db_path,
+        "LogFile": "/var/log/zabbix/zabbix_proxy.log",
+        "PidFile": "/run/zabbix/zabbix_proxy.pid",
+        "ProxyConfigFrequency": "60",
+        "DataSenderFrequency": "1",
+        "Timeout": "30",
+    }
+    for key, value in options.items():
+        content = set_config_value(content, key, value)
     content = remove_config_keys(content, [
-        "DBHost",
-        "DBPort",
-        "DBUser",
-        "DBPassword",
-        "DBSchema",
-        "DBSocket"
+        "DBHost", "DBPort", "DBUser", "DBPassword", "DBSchema", "DBSocket"
     ])
-
     conf.write_text(content, encoding="utf-8")
     print(f"Arquivo configurado: {conf_path}")
 
 
 def enable_and_start():
-    run("systemctl daemon-reload")
-    run("systemctl enable zabbix-proxy")
-    run("systemctl restart zabbix-proxy")
-    run("systemctl status zabbix-proxy --no-pager", check=False)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "zabbix-proxy"])
+    run(["systemctl", "restart", "zabbix-proxy"])
+    run(["systemctl", "status", "zabbix-proxy", "--no-pager", "-l"], check=False)
+    if subprocess.run(["systemctl", "is-active", "--quiet", "zabbix-proxy"]).returncode:
+        raise RuntimeError(
+            "O Zabbix Proxy nao ficou ativo. Verifique: "
+            "journalctl -u zabbix-proxy -n 80 --no-pager"
+        )
 
 
 def show_summary(proxy_name, server_addr, proxy_mode, db_path, os_info, zabbix_version):
     print("\n" + "=" * 70)
-    print("INSTALAÇÃO FINALIZADA")
+    print("INSTALACAO FINALIZADA")
     print("=" * 70)
-    print(f"SO detectado        : {os_info['pretty_name']}")
-    print(f"Versão do Proxy     : {zabbix_version}")
-    print(f"Nome do Proxy       : {proxy_name}")
-    print(f"Zabbix Server       : {server_addr}")
-    print(f"Modo do Proxy       : {'Ativo' if proxy_mode == '0' else 'Passivo'}")
-    print(f"Banco SQLite        : {db_path}")
-    print("\nValide no frontend do Zabbix se o nome do proxy está exatamente igual ao cadastrado.")
+    print(f"SO detectado       : {os_info['pretty_name']}")
+    print(f"Versao do Proxy    : {zabbix_version}")
+    print(f"Nome do Proxy      : {proxy_name}")
+    print(f"Zabbix Server      : {server_addr}")
+    print(f"Modo do Proxy      : {'Ativo' if proxy_mode == '0' else 'Passivo'}")
+    print(f"Banco SQLite       : {db_path}")
+    print("Confira se o nome do proxy coincide exatamente com o cadastrado no frontend.")
 
 
 def main():
     ensure_root()
-
     print("=" * 70)
     print("INSTALADOR ZABBIX PROXY COM SQLITE")
     print("=" * 70)
-
     os_info = detect_os()
     print(f"\nSO detectado automaticamente: {os_info['pretty_name']}")
-
-    # Apenas confirmação visual. Não altera a detecção real do sistema.
     ask("Qual SO vai ser instalado", default=os_info["pretty_name"], required=False)
-
     zabbix_version = ask(
-        "Qual versão do Proxy que vou instalar",
-        default="7.0",
-        allowed=SUPPORTED_ZABBIX
+        "Qual versao do Proxy que vou instalar", default="7.0", allowed=SUPPORTED_ZABBIX
     )
-
     proxy_name = ask("Qual nome que vou colocar no proxy")
     server_addr = ask("Qual IP ou DNS do Zabbix Server")
-    proxy_mode = ask(
-        "Modo do proxy (0=Ativo / 1=Passivo)",
-        default="0",
-        allowed=["0", "1"]
-    )
-
-    db_path = ask(
-        "Caminho do arquivo SQLite",
-        default="/var/lib/zabbix/zabbix_proxy.db"
-    )
-
-    print("\nIniciando instalação...")
+    proxy_mode = ask("Modo do proxy (0=Ativo / 1=Passivo)", default="0", allowed=["0", "1"])
+    db_path = ask("Caminho do arquivo SQLite", default="/var/lib/zabbix/zabbix_proxy.db")
+    print("\nIniciando instalacao...")
     install_prereqs(os_info)
     install_zabbix_repo(os_info, zabbix_version)
     install_proxy(os_info)
     prepare_sqlite_directory(db_path)
     configure_proxy(
-        conf_path="/etc/zabbix/zabbix_proxy.conf",
-        proxy_name=proxy_name,
-        server_addr=server_addr,
-        proxy_mode=proxy_mode,
-        db_path=db_path
+        "/etc/zabbix/zabbix_proxy.conf", proxy_name, server_addr, proxy_mode, db_path
     )
     enable_and_start()
     show_summary(proxy_name, server_addr, proxy_mode, db_path, os_info, zabbix_version)
@@ -334,7 +314,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nExecução cancelada pelo usuário.")
+        print("\nExecucao cancelada pelo usuario.")
         sys.exit(1)
     except Exception as exc:
         print(f"\nERRO: {exc}")
