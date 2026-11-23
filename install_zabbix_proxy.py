@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 """Instalador interativo de Zabbix Proxy com SQLite3.
 
-Corrige o caminho do repositorio para Oracle Linux 8/9 e utiliza
-ProxyConfigFrequency nas configuracoes do Zabbix Proxy.
+Compativel com Python 3.6+ (incluindo Oracle Linux 8).
+Normaliza diretivas duplicadas, seleciona ConfigFrequency (6.0) ou
+ProxyConfigFrequency (6.4+) e oferece --repair-config sem reinstalacao.
+Inclui o Zabbix Proxy 8.0 LTS e bloqueia atualizacoes acidentais.
 """
 
 import os
@@ -15,20 +17,20 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-SUPPORTED_ZABBIX = ["6.0", "6.4", "7.0", "7.2", "7.4"]
+SUPPORTED_ZABBIX = ["6.0", "6.4", "7.0", "7.2", "7.4", "8.0"]
 
 
 def run(cmd, check=True, capture_output=False):
     """Executa um comando e interrompe a instalacao se ele falhar."""
     if isinstance(cmd, (list, tuple)):
-        display = shlex.join(str(part) for part in cmd)
+        display = " ".join(shlex.quote(str(part)) for part in cmd)
     else:
         display = str(cmd)
     print(f"\n>> Executando: {display}")
     result = subprocess.run(
         cmd,
         shell=isinstance(cmd, str),
-        text=True,
+        universal_newlines=True,
         stdout=subprocess.PIPE if capture_output else None,
         stderr=subprocess.STDOUT if capture_output else None,
     )
@@ -118,15 +120,19 @@ def get_zabbix_release_rpm_url(os_info, zabbix_version):
     """URL de repositorio para distros da familia RHEL.
 
     Zabbix 7.0 usa o layout /oracle/9/x86_64 para Oracle Linux 9.
-    Zabbix 7.2/7.4 usa /release/<distro>/9/noarch.
+    Zabbix 7.2/7.4/8.0 usa /release/<distro>/<versao>/noarch.
     Para 6.0/6.4 o pacote compativel de RHEL e usado como fallback.
     """
     major = os_info["major"]
     os_id = os_info["id"]
     rpm = f"zabbix-release-latest-{zabbix_version}.el{major}.noarch.rpm"
 
-    if zabbix_version in ["7.2", "7.4"]:
-        if os_id in ["ol", "oracle"]:
+    if zabbix_version in ["7.2", "7.4", "8.0"]:
+        if zabbix_version == "8.0" and os_id in ["ol", "oracle"]:
+            # A release RPM de 8.0 para OL8/9 fica em release/rhel;
+            # os pacotes para Oracle ficam em stable/oracle.
+            distro = "rhel"
+        elif os_id in ["ol", "oracle"]:
             distro = "oracle" if major != "10" else "rhel"
         elif os_id == "almalinux":
             distro = "alma"
@@ -192,29 +198,122 @@ def install_proxy(os_info):
 def backup_file(file_path):
     path = Path(file_path)
     if path.exists():
-        suffix = datetime.now().strftime("%Y%m%d-%H%M%S")
+        suffix = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup = f"{file_path}.{suffix}.bak"
         shutil.copy2(file_path, backup)
         print(f"Backup criado: {backup}")
 
 
+def deduplicate_config(content):
+    """Remove duplicatas identicas sem alterar diretivas repetiveis validas.
+
+    Em caso de valores conflitantes, interrompe para revisao manual.
+    """
+    unique = {}
+    result = []
+    # Include e LoadModule podem ocorrer mais de uma vez no Zabbix.
+    repeatable = {"Include", "LoadModule"}
+    for line in content.splitlines(keepends=True):
+        match = re.match(r"^[ \t]*([A-Za-z][A-Za-z0-9_]*)[ \t]*=(.*)$", line)
+        if match:
+            key, value = match.group(1), match.group(2).strip()
+            if key not in repeatable:
+                if key in unique:
+                    if unique[key] != value:
+                        raise RuntimeError(
+                            "Parametro duplicado com valores diferentes: {} "
+                            "({!r} x {!r}). Revise o arquivo manualmente.".format(
+                                key, unique[key], value
+                            )
+                        )
+                    continue
+                unique[key] = value
+        result.append(line)
+    return "".join(result)
+
+
 def set_config_value(content, key, value):
-    pattern = rf"^\s*#?\s*{re.escape(key)}=.*$"
-    replacement = f"{key}={value}"
-    if re.search(pattern, content, flags=re.MULTILINE):
-        return re.sub(pattern, replacement, content, flags=re.MULTILINE)
-    return content.rstrip() + "\n" + replacement + "\n"
+    """Garante uma unica linha ativa e preserva comentarios do arquivo."""
+    lines = content.splitlines(keepends=True)
+    active_pattern = re.compile(r"^[ \t]*" + re.escape(key) + r"[ \t]*=")
+    indices = [i for i, line in enumerate(lines) if active_pattern.match(line)]
+    replacement = "{}={}\n".format(key, value)
+    if indices:
+        # Reescreve a primeira linha e remove as demais, se houver.
+        for i in reversed(indices[1:]):
+            del lines[i]
+        lines[indices[0]] = replacement
+        return "".join(lines)
+
+    # Quando ha um bloco '### Option: KEY' sem linha ativa, acrescenta
+    # a diretiva na secao correta, logo depois de '# Default:'.
+    heading_pattern = re.compile(r"^[ \t]*#{2,}[ \t]*Option:[ \t]*" + re.escape(key) + r"[ \t]*$")
+    for i, line in enumerate(lines):
+        if heading_pattern.match(line.rstrip("\r\n")):
+            for j in range(i + 1, len(lines)):
+                if re.match(r"^[ \t]*#{2,}[ \t]*Option:", lines[j]):
+                    break
+                if re.match(r"^[ \t]*#[ \t]*Default:", lines[j]):
+                    lines.insert(j + 1, replacement)
+                    return "".join(lines)
+            break
+    return content.rstrip("\r\n") + "\n" + replacement
 
 
 def remove_config_keys(content, keys):
-    for key in keys:
-        content = re.sub(
-            rf"^\s*#?\s*{re.escape(key)}=.*\n?",
-            "",
-            content,
-            flags=re.MULTILINE,
+    """Apaga apenas diretivas ativas; preserva a documentacao comentada."""
+    lines = content.splitlines(keepends=True)
+    patterns = [re.compile(r"^[ \t]*" + re.escape(key) + r"[ \t]*=") for key in keys]
+    return "".join(line for line in lines if not any(p.match(line) for p in patterns))
+
+
+def installed_proxy_version():
+    """Descobre a versao real do binario, sem depender da escolha no menu."""
+    output = run(["zabbix_proxy", "--version"], capture_output=True)
+    match = re.search(r"\b(\d+\.\d+)\.\d+\b", output)
+    if not match:
+        raise RuntimeError("Nao foi possivel identificar a versao instalada do Zabbix Proxy.")
+    return match.group(1)
+
+
+
+def prevent_unintended_upgrade(target_version):
+    """Nao altera um Proxy de outra versao nem seu banco SQLite existente."""
+    if not command_exists("zabbix_proxy"):
+        return
+    current_version = installed_proxy_version()
+    if current_version != target_version:
+        raise RuntimeError(
+            "Ja existe um Zabbix Proxy {} instalado; foi selecionado {}. "
+            "Por seguranca, o instalador nao faz upgrade/downgrade "
+            "automatico. Realize uma migracao planejada e faca backup "
+            "da base SQLite, que pode ser recriada ao mudar de versao."
+            .format(current_version, target_version)
         )
-    return content
+
+
+def frequency_option(zabbix_version):
+    return "ConfigFrequency" if zabbix_version == "6.0" else "ProxyConfigFrequency"
+
+
+def repair_existing_config():
+    """Corrige um conf existente sem reinstalar pacotes nem alterar o SQLite."""
+    version = installed_proxy_version()
+    conf = Path("/etc/zabbix/zabbix_proxy.conf")
+    if not conf.exists():
+        raise RuntimeError("Arquivo nao encontrado: {}".format(conf))
+    original = conf.read_text(encoding="utf-8", errors="replace")
+    content = deduplicate_config(original)
+    content = remove_config_keys(content, ["ConfigFrequency", "ProxyConfigFrequency"])
+    content = set_config_value(content, frequency_option(version), "60")
+    if content != original:
+        backup_file(str(conf))
+        conf.write_text(content, encoding="utf-8")
+        print("Configuracao corrigida para Zabbix {}: {}".format(version, conf))
+    else:
+        print("Configuracao ja esta normalizada: {}".format(conf))
+    print("Agora execute: systemctl restart zabbix-proxy")
+    print("E valide: journalctl -u zabbix-proxy -n 50 --no-pager")
 
 
 def prepare_sqlite_directory(db_path):
@@ -230,14 +329,14 @@ def prepare_sqlite_directory(db_path):
     print("Se o SQLite nao existir, o Zabbix Proxy o criara no primeiro start.")
 
 
-def configure_proxy(conf_path, proxy_name, server_addr, proxy_mode, db_path):
+def configure_proxy(conf_path, proxy_name, server_addr, proxy_mode, db_path, zabbix_version):
     conf = Path(conf_path)
     if not conf.exists():
         raise RuntimeError(f"Arquivo nao encontrado: {conf_path}")
-    backup_file(conf_path)
-    content = conf.read_text(encoding="utf-8", errors="ignore")
-    # Remove o nome antigo antes de definir o parametro recomendado no Zabbix 7.0.
-    content = remove_config_keys(content, ["ConfigFrequency"])
+    original = conf.read_text(encoding="utf-8", errors="replace")
+    content = original
+    # Remove a configuracao antiga, independentemente da versao anterior.
+    content = remove_config_keys(content, ["ConfigFrequency", "ProxyConfigFrequency"])
     options = {
         "ProxyMode": proxy_mode,
         "Server": server_addr,
@@ -245,17 +344,24 @@ def configure_proxy(conf_path, proxy_name, server_addr, proxy_mode, db_path):
         "DBName": db_path,
         "LogFile": "/var/log/zabbix/zabbix_proxy.log",
         "PidFile": "/run/zabbix/zabbix_proxy.pid",
-        "ProxyConfigFrequency": "60",
         "DataSenderFrequency": "1",
         "Timeout": "30",
     }
+    # Zabbix 6.0 aceita ConfigFrequency; a partir do 6.4 use ProxyConfigFrequency.
+    frequency_key = frequency_option(zabbix_version)
+    options[frequency_key] = "60"
     for key, value in options.items():
         content = set_config_value(content, key, value)
     content = remove_config_keys(content, [
         "DBHost", "DBPort", "DBUser", "DBPassword", "DBSchema", "DBSocket"
     ])
-    conf.write_text(content, encoding="utf-8")
-    print(f"Arquivo configurado: {conf_path}")
+    content = deduplicate_config(content)
+    if content != original:
+        backup_file(conf_path)
+        conf.write_text(content, encoding="utf-8")
+        print("Arquivo configurado: {}".format(conf_path))
+    else:
+        print("Arquivo ja estava correto: {}".format(conf_path))
 
 
 def enable_and_start():
@@ -299,12 +405,21 @@ def main():
     proxy_mode = ask("Modo do proxy (0=Ativo / 1=Passivo)", default="0", allowed=["0", "1"])
     db_path = ask("Caminho do arquivo SQLite", default="/var/lib/zabbix/zabbix_proxy.db")
     print("\nIniciando instalacao...")
+    prevent_unintended_upgrade(zabbix_version)
     install_prereqs(os_info)
     install_zabbix_repo(os_info, zabbix_version)
     install_proxy(os_info)
+    actual_version = installed_proxy_version()
+    if actual_version != zabbix_version:
+        raise RuntimeError(
+            "Versao instalada do Proxy ({}) diferente da selecionada ({}). "
+            "Verifique o repositorio e os pacotes antes de configurar.".format(
+                actual_version, zabbix_version
+            )
+        )
     prepare_sqlite_directory(db_path)
     configure_proxy(
-        "/etc/zabbix/zabbix_proxy.conf", proxy_name, server_addr, proxy_mode, db_path
+        "/etc/zabbix/zabbix_proxy.conf", proxy_name, server_addr, proxy_mode, db_path, zabbix_version
     )
     enable_and_start()
     show_summary(proxy_name, server_addr, proxy_mode, db_path, os_info, zabbix_version)
@@ -312,7 +427,14 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if len(sys.argv) == 2 and sys.argv[1] == "--repair-config":
+            ensure_root()
+            repair_existing_config()
+        elif len(sys.argv) == 1:
+            main()
+        else:
+            print("Uso: python3 install_zabbix_proxy.py [--repair-config]")
+            sys.exit(2)
     except KeyboardInterrupt:
         print("\nExecucao cancelada pelo usuario.")
         sys.exit(1)
